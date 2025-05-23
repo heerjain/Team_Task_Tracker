@@ -1,52 +1,88 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Security, Request
+from fastapi.responses import JSONResponse
+from fastapi.security.api_key import APIKeyHeader
+from fastapi.openapi.utils import get_openapi
+from sqlalchemy.exc import SQLAlchemyError
+from contextlib import asynccontextmanager
+import logging
+
 from typing import Union
-
-app = FastAPI(title="Team Task Tracker API")
-
-# === /projects endpoints ===
-
-@app.get("/projects/")
-def get_projects():
-    return {"message": "List of all projects"}
-
-@app.post("/projects/")
-def create_project(name: str, description: Union[str, None] = None):
-    return {"message": "Project created", "name": name, "description": description}
-
-# === /tasks endpoints ===
-
-@app.get("/tasks/")
-def get_tasks():
-    return {"message": "List of all tasks"}
-
-@app.post("/tasks/")
-def create_task(title: str, status: str = "pending", project_id: int = 1):
-    return {
-        "message": "Task created",
-        "title": title,
-        "status": status,
-        "project_id": project_id
-    }
-
-# app/main.
-from fastapi import FastAPI
 from app.routes import projects, tasks
+from app.config import API_KEY_NAME
+API_KEY = "1234"
+API_KEY_NAME = API_KEY_NAME
 
-app = FastAPI(title="Team Task Tracker API")
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Application startup")
+    yield
+    logger.info("Application shutdown")
+
+app = FastAPI(title="Team Task Tracker API", lifespan=lifespan)
+
+async def verify_api_key(api_key: str = Security(api_key_header)):
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
 
 app.include_router(
     projects.router,
     prefix="/projects",
-    tags=["Projects"]
+    tags=["Projects"],
+    dependencies=[Security(verify_api_key)]
 )
 app.include_router(
     tasks.router,
     prefix="/tasks",
-    tags=["Tasks"]
+    tags=["Tasks"],
+    dependencies=[Security(verify_api_key)]
 )
 
 
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title="Team Task Tracker API",
+        version="1.0.0",
+        description="This API requires an access token in headers.",
+        routes=app.routes,
+    )
+    openapi_schema["components"]["securitySchemes"] = {
+        "APIKeyHeader": {
+            "type": "apiKey",
+            "in": "header",
+            "name": API_KEY_NAME,
+        }
+    }
+    for path in openapi_schema["paths"].values():
+        for method in path.values():
+            method.setdefault("security", []).append({"APIKeyHeader": []})
+
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
 
 
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc):
+    logger.warning(f"404 Not Found: {request.url}")
+    return JSONResponse(status_code=404, content={"detail": "Resource not found"})
 
+@app.exception_handler(SQLAlchemyError)
+async def db_exception_handler(request: Request, exc):
+    logger.error(f"Database error on {request.url}: {exc}")
+    return JSONResponse(status_code=500, content={"detail": "Internal database error"})
+
+
+@app.get("/")
+async def read_root():
+    return {"message": "Hello from FastAPI"}
 
